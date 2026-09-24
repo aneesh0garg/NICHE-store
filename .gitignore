@@ -1,0 +1,7 @@
+node_modules/
+dist/
+data/store.json
+data/*.db
+data/creator-storefront.db-*
+.env
+.env.*
