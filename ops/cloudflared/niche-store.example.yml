@@ -1,0 +1,7 @@
+tunnel: REPLACE_WITH_TUNNEL_UUID
+credentials-file: /Users/REPLACE_WITH_USERNAME/.cloudflared/REPLACE_WITH_TUNNEL_UUID.json
+
+ingress:
+  - hostname: store.pi-coding.com
+    service: http://127.0.0.1:4173
+  - service: http_status:404

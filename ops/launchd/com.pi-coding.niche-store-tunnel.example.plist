@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.pi-coding.niche-store-tunnel</string>
+  <key>ProgramArguments</key><array><string>/usr/local/bin/cloudflared</string><string>--config</string><string>/Users/REPLACE_WITH_USERNAME/PiProjects/NICHE-store/ops/cloudflared/niche-store.yml</string><string>tunnel</string><string>run</string></array>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/REPLACE_WITH_USERNAME/PiProjects/NICHE-store/logs/niche-store-tunnel.log</string>
+  <key>StandardErrorPath</key><string>/Users/REPLACE_WITH_USERNAME/PiProjects/NICHE-store/logs/niche-store-tunnel.error.log</string>
+</dict></plist>

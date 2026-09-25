@@ -1,7 +1,12 @@
 node_modules/
 dist/
-data/store.json
-data/*.db
-data/creator-storefront.db-*
+data/
+!data/.gitkeep
+logs/
 .env
 .env.*
+!.env.example
+ops/cloudflared/*.yml
+!ops/cloudflared/*.example.yml
+ops/launchd/*.plist
+!ops/launchd/*.example.plist
