@@ -52,4 +52,4 @@ Every verified Razorpay payment queues one receipt in the local outbox. Set `APP
 
 ## Status
 
-This is a functional local MVP foundation: public storefronts, creator accounts, protected dashboards, product publishing, Razorpay test checkout, persistent local data, and purchase access. Production still requires managed Postgres, webhook event mapping/refunds, email delivery, file storage/secure downloads, legal policies, and operational controls.
+This is a functional local MVP foundation: public storefronts, creator accounts, protected dashboards, product publishing, Razorpay test checkout, provider-confirmed full refunds, persistent local data, and purchase access. Production still requires managed Postgres, receipt sender configuration, production object storage/secure downloads, legal policies, and operational controls.

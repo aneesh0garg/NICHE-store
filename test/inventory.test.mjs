@@ -55,6 +55,14 @@ test('a limited product accepts one checkout and rejects the next', async () => 
   const store = await request(`/api/storefront?handle=${handle}`);
   assert.equal(store.body.products[0].sold, 1);
   assert.equal(store.body.products[0].soldOut, true);
+  const db = new DatabaseSync('data/creator-storefront.db');
+  const paymentId = `pay_search_${Date.now()}`;
+  db.prepare('UPDATE orders SET provider_payment_id = ? WHERE id = ?').run(paymentId, first.body.order.id);
+  db.close();
+  const providerSearch = await request(`/api/orders?q=${encodeURIComponent(paymentId)}`, { headers: { Cookie: cookie } });
+  assert.equal(providerSearch.response.status, 200);
+  assert.equal(providerSearch.body.orders[0].id, first.body.order.id);
+  assert.equal(providerSearch.body.orders[0].providerPaymentId, paymentId);
 });
 
 test('a paid digital product grants a private download URL and revokes it after refund', async () => {

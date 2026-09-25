@@ -58,7 +58,7 @@ Copy `.env.example` to `.env`; never commit `.env`.
 6. `payment.captured` webhooks are signature-checked, stored idempotently in `webhook_events`, and reconcile the same order safely if the browser flow did not complete.
 7. A creator can request one full refund per paid order. Razorpay is asked to create the refund server-side; an order is marked refunded only when Razorpay returns or webhooks a `processed` status. Pending and failed refunds remain visible in the creator dashboard.
 
-Before live payments, configure Razorpay to send `payment.captured`, `payment.failed`, `refund.created`, and `refund.processed` to:
+Before live payments, configure Razorpay to send `payment.captured`, `payment.failed`, `refund.created`, `refund.processed`, and `refund.failed` to:
 
 ```text
 https://store.pi-coding.com/api/webhooks/razorpay
