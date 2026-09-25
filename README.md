@@ -48,7 +48,7 @@ Creators can attach one supported file (PDF, ZIP, JSON, CSV, text, PNG, or JPEG;
 
 ### Purchase receipts
 
-Every verified Razorpay payment queues one receipt in the local outbox. Set `APP_URL`, `RESEND_API_KEY`, and `RECEIPT_FROM_EMAIL` to send it through Resend; the sender domain must be verified in Resend. The delivery call uses a stable idempotency key per order, so webhook/browser retries do not duplicate the email. [Resend's email API](https://resend.com/vercel) accepts a server-side Bearer API key and an `Idempotency-Key` header for this flow.
+Every verified Razorpay payment queues a buyer receipt and a creator sale notification in local outboxes. Set `APP_URL`, `RESEND_API_KEY`, and `RECEIPT_FROM_EMAIL` to send them through Resend; the sender domain must be verified in Resend. Delivery uses a stable idempotency key per order and retries queued or failed messages every 15 minutes, so webhook/browser retries do not duplicate email. [Resend's email API](https://resend.com/vercel) accepts a server-side Bearer API key and an `Idempotency-Key` header for this flow.
 
 ## Status
 

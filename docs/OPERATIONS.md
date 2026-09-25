@@ -68,7 +68,7 @@ https://store.pi-coding.com/api/webhooks/razorpay
 
 Creators can attach one allowed private file to a digital-download product. The server stores it in `data/assets/`; a paid buyer’s purchase library grants a 24-hour signed download URL. Download grants stop working for refunded or unpaid orders.
 
-Each verified Razorpay payment writes one idempotent receipt record to `email_outbox`. If Resend is configured, the server submits the receipt and purchase-library link to Resend with a stable idempotency key. Otherwise it remains queued until sending is configured.
+Each verified Razorpay payment writes one idempotent buyer receipt to `email_outbox` and one creator sale notification to `creator_sale_notifications`. If Resend is configured, the server submits both with stable idempotency keys and retries queued or failed messages every 15 minutes. Otherwise they remain queued until sending is configured.
 
 ## Verification
 

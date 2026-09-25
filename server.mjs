@@ -35,6 +35,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS product_assets (id TEXT PRIMARY KEY, product_id TEXT NOT NULL UNIQUE REFERENCES products(id) ON DELETE CASCADE, original_name TEXT NOT NULL, mime_type TEXT NOT NULL, storage_key TEXT NOT NULL UNIQUE, byte_size INTEGER NOT NULL, created_at TEXT NOT NULL) STRICT;
   CREATE TABLE IF NOT EXISTS download_grants (token TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE, asset_id TEXT NOT NULL REFERENCES product_assets(id) ON DELETE CASCADE, expires_at TEXT NOT NULL, download_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL) STRICT;
   CREATE TABLE IF NOT EXISTS email_outbox (id TEXT PRIMARY KEY, order_id TEXT NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE, recipient TEXT NOT NULL, subject TEXT NOT NULL, html TEXT NOT NULL, status TEXT NOT NULL, provider_message_id TEXT, failure_reason TEXT, created_at TEXT NOT NULL, sent_at TEXT) STRICT;
+  CREATE TABLE IF NOT EXISTS creator_sale_notifications (id TEXT PRIMARY KEY, order_id TEXT NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE, recipient TEXT NOT NULL, subject TEXT NOT NULL, html TEXT NOT NULL, status TEXT NOT NULL, provider_message_id TEXT, failure_reason TEXT, created_at TEXT NOT NULL, sent_at TEXT) STRICT;
   CREATE TABLE IF NOT EXISTS storefront_visits (id TEXT PRIMARY KEY, creator_id TEXT NOT NULL REFERENCES creators(id) ON DELETE CASCADE, visitor_id TEXT NOT NULL, visited_on TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(creator_id, visitor_id, visited_on)) STRICT;
 `);
 // SQLite cannot add a column through CREATE TABLE IF NOT EXISTS. Keep this
@@ -88,6 +89,7 @@ function settleRazorpayPayment(order, paymentId, source) {
     audit(null, 'order.paid', 'order', order.id, { creatorId: order.creator_id, productId: order.product_id, amountMinor: order.amount_minor, provider: 'razorpay', providerPaymentId: paymentId, source });
     db.exec('COMMIT');
     queueReceipt(order);
+    queueCreatorSaleNotification(order);
     return { status: 200, body: { success: true, purchaseLibraryUrl: `/purchases/${order.access_token}` } };
   } catch (error) { db.exec('ROLLBACK'); throw error; }
 }
@@ -176,6 +178,32 @@ function queueReceipt(order) {
   const inserted = run('INSERT OR IGNORE INTO email_outbox (id, order_id, recipient, subject, html, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)', message.id, message.orderId, message.recipient, message.subject, message.html, 'queued', message.createdAt);
   if (inserted.changes === 1) void dispatchReceipt(message.id);
 }
+async function dispatchCreatorSaleNotification(messageId) {
+  const message = first('SELECT * FROM creator_sale_notifications WHERE id = ? AND status IN (?, ?)', messageId, 'queued', 'failed');
+  if (!message || !process.env.RESEND_API_KEY || !process.env.RECEIPT_FROM_EMAIL) return;
+  run('UPDATE creator_sale_notifications SET status = ?, failure_reason = NULL WHERE id = ?', 'sending', message.id);
+  try {
+    const response = await fetch('https://api.resend.com/emails', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'Idempotency-Key': `niche-sale/${message.order_id}` }, body: JSON.stringify({ from: process.env.RECEIPT_FROM_EMAIL, to: [message.recipient], subject: message.subject, html: message.html }) });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result?.message || `Resend returned ${response.status}`);
+    run('UPDATE creator_sale_notifications SET status = ?, provider_message_id = ?, sent_at = ? WHERE id = ?', 'sent', String(result.id || ''), now(), message.id);
+  } catch (error) { run('UPDATE creator_sale_notifications SET status = ?, failure_reason = ? WHERE id = ?', 'failed', String(error?.message || 'Email delivery failed.').slice(0, 500), message.id); }
+}
+function queueCreatorSaleNotification(order) {
+  const product = first('SELECT title FROM products WHERE id = ?', order.product_id);
+  const creator = first('SELECT name, email FROM creators WHERE id = ?', order.creator_id);
+  if (!creator) return;
+  const message = { id: `sale_${randomUUID().replaceAll('-', '').slice(0, 16)}`, orderId: order.id, recipient: creator.email, subject: `New sale — ${product?.title || 'NICHE store purchase'}`, html: `<main><h1>You made a sale.</h1><p><strong>${htmlEscape(order.buyer_name)}</strong> purchased <strong>${htmlEscape(product?.title || 'your item')}</strong> for ₹${(order.amount_minor / 100).toFixed(2)}.</p><p>Order reference: ${htmlEscape(order.id)}</p><p>Sign in to NICHE store to view the order and manage support.</p></main>`, createdAt: now() };
+  const inserted = run('INSERT OR IGNORE INTO creator_sale_notifications (id, order_id, recipient, subject, html, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)', message.id, message.orderId, message.recipient, message.subject, message.html, 'queued', message.createdAt);
+  if (inserted.changes === 1) void dispatchCreatorSaleNotification(message.id);
+}
+function retryQueuedEmailDelivery() {
+  if (!process.env.RESEND_API_KEY || !process.env.RECEIPT_FROM_EMAIL) return;
+  for (const message of all("SELECT id FROM email_outbox WHERE status IN ('queued', 'failed') ORDER BY created_at ASC LIMIT 25")) void dispatchReceipt(message.id);
+  for (const message of all("SELECT id FROM creator_sale_notifications WHERE status IN ('queued', 'failed') ORDER BY created_at ASC LIMIT 25")) void dispatchCreatorSaleNotification(message.id);
+}
+queueMicrotask(retryQueuedEmailDelivery);
+setInterval(retryQueuedEmailDelivery, 15 * 60 * 1000).unref();
 const rateLimitWindows = new Map();
 function isRateLimited(req, scope, maxAttempts, windowMs) {
   const timestamp = Date.now();
