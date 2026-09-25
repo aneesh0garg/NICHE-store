@@ -56,6 +56,7 @@ Copy `.env.example` to `.env`; never commit `.env`.
 4. The browser submits Razorpay’s payment ID, provider order ID, and signature to `POST /api/verify-payment`.
 5. The server verifies the HMAC-SHA256 signature, atomically consumes inventory, marks the order paid, creates an audit record, and queues a receipt.
 6. `payment.captured` webhooks are signature-checked, stored idempotently in `webhook_events`, and reconcile the same order safely if the browser flow did not complete.
+7. A creator can request one full refund per paid order. Razorpay is asked to create the refund server-side; an order is marked refunded only when Razorpay returns or webhooks a `processed` status. Pending and failed refunds remain visible in the creator dashboard.
 
 Before live payments, configure Razorpay to send `payment.captured`, `payment.failed`, `refund.created`, and `refund.processed` to:
 
@@ -81,11 +82,20 @@ git diff --check
 
 The automated test suite covers inventory oversell protection and paid private-download access.
 
+### Razorpay test payments
+
+Use these only while the application is configured with Razorpay **test-mode** keys. Never enter them into a live checkout.
+
+| Method | Test details |
+| --- | --- |
+| Card | `4100 2800 0000 1007` · CVV `123` · expiry `12/26` |
+| UPI | `test@razorpay` |
+
 ## Production checklist
 
 - Replace shared/test keys with newly generated live Razorpay and Resend credentials.
 - Remove the public demo creator/account and test products.
-- Configure the Razorpay webhook secret and events.
+- Configure the Razorpay webhook secret and events, including `refund.created`, `refund.processed`, and `refund.failed`.
 - Verify the Resend sender domain and set `RECEIPT_FROM_EMAIL`.
 - Confirm backups for `data/` and a restore procedure.
 - Review terms, privacy, refund rules, creator approval, tax, and payout requirements with qualified advisers.

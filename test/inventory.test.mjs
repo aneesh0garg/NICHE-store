@@ -32,6 +32,7 @@ test.after(async () => {
   if (creator) {
     assetStorageKeys.push(...db.prepare('SELECT storage_key FROM product_assets WHERE product_id IN (SELECT id FROM products WHERE creator_id = ?)').all(creator.id).map((asset) => asset.storage_key));
     db.prepare('DELETE FROM audit_events WHERE actor_id = ? OR metadata LIKE ?').run(creator.id, `%${creator.id}%`);
+    db.prepare('DELETE FROM refunds WHERE creator_id = ?').run(creator.id);
     db.prepare('DELETE FROM orders WHERE creator_id = ?').run(creator.id);
     db.prepare('DELETE FROM products WHERE creator_id = ?').run(creator.id);
     db.prepare('DELETE FROM creators WHERE id = ?').run(creator.id);
@@ -56,7 +57,7 @@ test('a limited product accepts one checkout and rejects the next', async () => 
   assert.equal(store.body.products[0].soldOut, true);
 });
 
-test('a paid digital product grants a private, expiring download URL', async () => {
+test('a paid digital product grants a private download URL and revokes it after refund', async () => {
   const login = await request('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password: 'inventory-test-password' }) });
   const cookie = login.response.headers.get('set-cookie').split(';')[0];
   const product = await request('/api/products', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ title: 'Private download', description: 'A protected file delivery test product.', priceMinor: 100, type: 'Digital download' }) });
@@ -70,4 +71,9 @@ test('a paid digital product grants a private, expiring download URL', async () 
   const file = await fetch(`${baseUrl}${library.body.purchases[0].product.downloadUrl}`);
   assert.equal(file.status, 200);
   assert.equal(await file.text(), 'private download');
+  const refund = await request(`/api/orders/${checkout.body.order.id}/refund`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ reason: 'Automated refund check' }) });
+  assert.equal(refund.response.status, 201);
+  assert.equal(refund.body.refund.state, 'test_refunded');
+  const revokedFile = await fetch(`${baseUrl}${library.body.purchases[0].product.downloadUrl}`);
+  assert.equal(revokedFile.status, 404);
 });

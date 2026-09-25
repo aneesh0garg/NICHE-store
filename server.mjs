@@ -62,6 +62,10 @@ db.exec('CREATE UNIQUE INDEX IF NOT EXISTS orders_provider_payment_id_unique ON 
 const refundColumns = db.prepare('PRAGMA table_info(refunds)').all().map((column) => column.name);
 if (!refundColumns.includes('creator_id')) db.exec("ALTER TABLE refunds ADD COLUMN creator_id TEXT NOT NULL DEFAULT ''");
 if (!refundColumns.includes('reason')) db.exec("ALTER TABLE refunds ADD COLUMN reason TEXT NOT NULL DEFAULT ''");
+if (!refundColumns.includes('provider_refund_id')) db.exec('ALTER TABLE refunds ADD COLUMN provider_refund_id TEXT');
+if (!refundColumns.includes('provider_payment_id')) db.exec('ALTER TABLE refunds ADD COLUMN provider_payment_id TEXT');
+if (!refundColumns.includes('processed_at')) db.exec('ALTER TABLE refunds ADD COLUMN processed_at TEXT');
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS refunds_provider_refund_id_unique ON refunds(provider_refund_id) WHERE provider_refund_id IS NOT NULL');
 
 const now = () => new Date().toISOString();
 const first = (sql, ...parameters) => db.prepare(sql).get(...parameters);
@@ -86,6 +90,25 @@ function settleRazorpayPayment(order, paymentId, source) {
     queueReceipt(order);
     return { status: 200, body: { success: true, purchaseLibraryUrl: `/purchases/${order.access_token}` } };
   } catch (error) { db.exec('ROLLBACK'); throw error; }
+}
+function settleRazorpayRefund(refund, providerRefund, source) {
+  if (!refund || !providerRefund?.id || providerRefund.payment_id !== refund.provider_payment_id || providerRefund.amount !== refund.amount_minor) return { status: 409, body: { error: 'Refund details did not match the original payment.' } };
+  const providerState = String(providerRefund.status || 'pending');
+  if (!['pending', 'processed', 'failed'].includes(providerState)) return { status: 409, body: { error: 'Razorpay returned an unsupported refund status.' } };
+  if (refund.state === 'processed' && providerState === 'processed') return { status: 200, body: { success: true, alreadyProcessed: true } };
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    if (providerState === 'processed') {
+      run("UPDATE orders SET state = 'refunded' WHERE id = ? AND state = 'paid'", refund.order_id);
+      run("UPDATE refunds SET state = 'processed', processed_at = ? WHERE id = ?", now(), refund.id);
+      audit(null, 'refund.processed', 'refund', refund.id, { orderId: refund.order_id, providerRefundId: providerRefund.id, source });
+    } else {
+      run('UPDATE refunds SET state = ? WHERE id = ?', providerState, refund.id);
+      audit(null, providerState === 'failed' ? 'refund.failed' : 'refund.pending', 'refund', refund.id, { orderId: refund.order_id, providerRefundId: providerRefund.id, source });
+    }
+    db.exec('COMMIT');
+  } catch (error) { db.exec('ROLLBACK'); throw error; }
+  return { status: 200, body: { success: true, refundState: providerState } };
 }
 
 if (!first('SELECT id FROM creators WHERE handle = ?', 'mayahq')) {
@@ -166,14 +189,14 @@ function isRateLimited(req, scope, maxAttempts, windowMs) {
 
 function dashboard(creatorId) {
   const products = all('SELECT * FROM products WHERE creator_id = ? ORDER BY created_at DESC', creatorId).map(serializeProduct);
-  const recentOrders = all('SELECT orders.*, products.title AS product_title FROM orders JOIN products ON products.id = orders.product_id WHERE orders.creator_id = ? ORDER BY orders.created_at DESC LIMIT 5', creatorId).map((order) => ({ id: order.id, buyerName: order.buyer_name, amountMinor: order.amount_minor, currency: order.currency, state: order.state, createdAt: order.created_at, product: { title: order.product_title } }));
+  const recentOrders = all('SELECT orders.*, products.title AS product_title, refunds.state AS refund_state FROM orders JOIN products ON products.id = orders.product_id LEFT JOIN refunds ON refunds.order_id = orders.id WHERE orders.creator_id = ? ORDER BY orders.created_at DESC LIMIT 5', creatorId).map((order) => ({ id: order.id, buyerName: order.buyer_name, amountMinor: order.amount_minor, currency: order.currency, state: order.state, refundState: order.refund_state || null, createdAt: order.created_at, product: { title: order.product_title } }));
   const totals = first("SELECT COALESCE(SUM(amount_minor), 0) AS sales, COUNT(*) AS orders FROM orders WHERE creator_id = ? AND state IN ('paid', 'test_paid')", creatorId);
   const visits = first('SELECT COUNT(*) AS count FROM storefront_visits WHERE creator_id = ?', creatorId).count;
   const conversion = visits ? Number((totals.orders / visits * 100).toFixed(2)) : 0;
   const topProducts = all("SELECT products.id, products.title, COALESCE(SUM(orders.amount_minor), 0) AS sales_minor, COUNT(orders.id) AS order_count FROM products LEFT JOIN orders ON orders.product_id = products.id AND orders.state IN ('paid', 'test_paid') WHERE products.creator_id = ? GROUP BY products.id ORDER BY sales_minor DESC, order_count DESC, products.created_at DESC LIMIT 5", creatorId).map((row) => ({ id: row.id, title: row.title, salesMinor: row.sales_minor, orderCount: row.order_count }));
   return { summary: { totalSalesMinor: totals.sales, orderCount: totals.orders, visits, conversion }, products, recentOrders, topProducts };
 }
-function serializeOrder(row) { return { id: row.id, buyerName: row.buyer_name, buyerEmail: row.buyer_email, amountMinor: row.amount_minor, discountMinor: row.discount_minor || 0, couponCode: row.coupon_code || null, currency: row.currency, state: row.state, createdAt: row.created_at, product: { id: row.product_id, title: row.product_title } }; }
+function serializeOrder(row) { return { id: row.id, buyerName: row.buyer_name, buyerEmail: row.buyer_email, amountMinor: row.amount_minor, discountMinor: row.discount_minor || 0, couponCode: row.coupon_code || null, currency: row.currency, state: row.state, refundState: row.refund_state || null, createdAt: row.created_at, product: { id: row.product_id, title: row.product_title } }; }
 function serializePurchase(row) { return { id: row.id, amountMinor: row.amount_minor, currency: row.currency, state: row.state, purchasedAt: row.created_at, product: { id: row.product_id, title: row.product_title, type: row.product_type, description: row.product_description, externalUrl: row.external_url || null, bookingUrl: row.booking_url || null } }; }
 
 async function handleApi(req, res, url) {
@@ -190,8 +213,8 @@ async function handleApi(req, res, url) {
   if (req.method === 'POST' && url.pathname === '/api/auth/login') { const { email, password } = await readJson(req); const creator = first('SELECT * FROM creators WHERE email = ?', String(email || '').trim().toLowerCase()); if (!creator || !passwordMatches(String(password || ''), creator.password_hash)) return json(res, 401, { error: 'Incorrect email or password.' }); setSession(res, creator.id); return json(res, 200, { creator: serializeCreator(creator) }); }
   if (req.method === 'POST' && url.pathname === '/api/auth/logout') { clearSession(req, res); return json(res, 204, {}); }
   if (req.method === 'GET' && url.pathname === '/api/dashboard') { const creator = requireCreator(req, res); if (!creator) return; return json(res, 200, dashboard(creator.id)); }
-  if (req.method === 'GET' && url.pathname === '/api/orders') { const creator = requireCreator(req, res); if (!creator) return; const query = String(url.searchParams.get('q') || '').trim().slice(0, 100); const pattern = `%${query.replaceAll('%', '\\%').replaceAll('_', '\\_')}%`; const orders = query ? all("SELECT orders.*, products.title AS product_title FROM orders JOIN products ON products.id = orders.product_id WHERE orders.creator_id = ? AND (orders.id LIKE ? ESCAPE '\\' OR orders.buyer_email LIKE ? ESCAPE '\\' OR orders.buyer_name LIKE ? ESCAPE '\\' OR products.title LIKE ? ESCAPE '\\') ORDER BY orders.created_at DESC LIMIT 50", creator.id, pattern, pattern, pattern, pattern) : all('SELECT orders.*, products.title AS product_title FROM orders JOIN products ON products.id = orders.product_id WHERE orders.creator_id = ? ORDER BY orders.created_at DESC LIMIT 50', creator.id); return json(res, 200, { orders: orders.map(serializeOrder) }); }
-  if (req.method === 'GET' && url.pathname === '/api/orders/export.csv') { const creator = requireCreator(req, res); if (!creator) return; const orders = all('SELECT orders.*, products.title AS product_title FROM orders JOIN products ON products.id = orders.product_id WHERE orders.creator_id = ? ORDER BY orders.created_at DESC', creator.id); return csv(res, `niche-store-orders-${new Date().toISOString().slice(0, 10)}.csv`, [['Order ID', 'Buyer name', 'Buyer email', 'Product', 'Amount minor', 'Currency', 'State', 'Coupon', 'Discount minor', 'Created at'], ...orders.map((order) => [order.id, order.buyer_name, order.buyer_email, order.product_title, order.amount_minor, order.currency, order.state, order.coupon_code, order.discount_minor, order.created_at])]); }
+  if (req.method === 'GET' && url.pathname === '/api/orders') { const creator = requireCreator(req, res); if (!creator) return; const query = String(url.searchParams.get('q') || '').trim().slice(0, 100); const pattern = `%${query.replaceAll('%', '\\%').replaceAll('_', '\\_')}%`; const orders = query ? all("SELECT orders.*, products.title AS product_title, refunds.state AS refund_state FROM orders JOIN products ON products.id = orders.product_id LEFT JOIN refunds ON refunds.order_id = orders.id WHERE orders.creator_id = ? AND (orders.id LIKE ? ESCAPE '\\' OR orders.buyer_email LIKE ? ESCAPE '\\' OR orders.buyer_name LIKE ? ESCAPE '\\' OR products.title LIKE ? ESCAPE '\\') ORDER BY orders.created_at DESC LIMIT 50", creator.id, pattern, pattern, pattern, pattern) : all('SELECT orders.*, products.title AS product_title, refunds.state AS refund_state FROM orders JOIN products ON products.id = orders.product_id LEFT JOIN refunds ON refunds.order_id = orders.id WHERE orders.creator_id = ? ORDER BY orders.created_at DESC LIMIT 50', creator.id); return json(res, 200, { orders: orders.map(serializeOrder) }); }
+  if (req.method === 'GET' && url.pathname === '/api/orders/export.csv') { const creator = requireCreator(req, res); if (!creator) return; const orders = all('SELECT orders.*, products.title AS product_title, refunds.state AS refund_state FROM orders JOIN products ON products.id = orders.product_id LEFT JOIN refunds ON refunds.order_id = orders.id WHERE orders.creator_id = ? ORDER BY orders.created_at DESC', creator.id); return csv(res, `niche-store-orders-${new Date().toISOString().slice(0, 10)}.csv`, [['Order ID', 'Buyer name', 'Buyer email', 'Product', 'Amount minor', 'Currency', 'State', 'Refund status', 'Coupon', 'Discount minor', 'Created at'], ...orders.map((order) => [order.id, order.buyer_name, order.buyer_email, order.product_title, order.amount_minor, order.currency, order.state, order.refund_state, order.coupon_code, order.discount_minor, order.created_at])]); }
   if (req.method === 'GET' && /^\/api\/downloads\/[A-Za-z0-9_-]{32,}$/.test(url.pathname)) {
     const token = url.pathname.split('/')[3];
     const download = first("SELECT download_grants.*, product_assets.original_name, product_assets.mime_type, product_assets.storage_key FROM download_grants JOIN product_assets ON product_assets.id = download_grants.asset_id JOIN orders ON orders.id = download_grants.order_id WHERE download_grants.token = ? AND download_grants.expires_at > ? AND orders.state IN ('paid', 'test_paid')", token, now());
@@ -212,7 +235,49 @@ async function handleApi(req, res, url) {
     if (purchase.asset_name) serialized.product.assetName = purchase.asset_name;
     return json(res, 200, { purchases: [serialized] });
   }
-  if (req.method === 'POST' && /^\/api\/orders\/[^/]+\/refund$/.test(url.pathname)) { const creator = requireCreator(req, res); if (!creator) return; const orderId = decodeURIComponent(url.pathname.split('/')[3]); const { reason = '' } = await readJson(req); const order = first('SELECT * FROM orders WHERE id = ? AND creator_id = ?', orderId, creator.id); if (!order) return json(res, 404, { error: 'Order not found.' }); if (order.provider !== 'local_test') return json(res, 409, { error: 'Live-payment refunds require provider confirmation.' }); if (order.state !== 'test_paid') return json(res, 409, { error: 'This order cannot be refunded.' }); const refund = { id: `refund_${randomUUID().replaceAll('-', '').slice(0, 16)}`, orderId: order.id, creatorId: creator.id, amountMinor: order.amount_minor, state: 'test_refunded', reason: String(reason).trim().slice(0, 280), createdAt: now() }; db.exec('BEGIN IMMEDIATE'); try { const updated = run("UPDATE orders SET state = 'test_refunded' WHERE id = ? AND state = 'test_paid'", order.id); if (updated.changes !== 1) { db.exec('ROLLBACK'); return json(res, 409, { error: 'This order was already refunded.' }); } run('INSERT INTO refunds (id, order_id, creator_id, amount_minor, state, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)', refund.id, refund.orderId, refund.creatorId, refund.amountMinor, refund.state, refund.reason, refund.createdAt); audit(creator.id, 'refund.created', 'refund', refund.id, { orderId: order.id, amountMinor: refund.amountMinor }); db.exec('COMMIT'); } catch (error) { db.exec('ROLLBACK'); throw error; } return json(res, 201, { refund }); }
+  if (req.method === 'POST' && /^\/api\/orders\/[^/]+\/refund$/.test(url.pathname)) {
+    const creator = requireCreator(req, res); if (!creator) return;
+    const orderId = decodeURIComponent(url.pathname.split('/')[3]);
+    const { reason = '' } = await readJson(req);
+    const order = first('SELECT * FROM orders WHERE id = ? AND creator_id = ?', orderId, creator.id);
+    if (!order) return json(res, 404, { error: 'Order not found.' });
+    if (first('SELECT id FROM refunds WHERE order_id = ?', order.id)) return json(res, 409, { error: 'A refund was already requested for this order.' });
+    const refund = { id: `refund_${randomUUID().replaceAll('-', '').slice(0, 16)}`, orderId: order.id, creatorId: creator.id, amountMinor: order.amount_minor, reason: String(reason).trim().slice(0, 280), createdAt: now() };
+    if (order.provider === 'local_test') {
+      if (order.state !== 'test_paid') return json(res, 409, { error: 'This order cannot be refunded.' });
+      refund.state = 'test_refunded';
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const updated = run("UPDATE orders SET state = 'test_refunded' WHERE id = ? AND state = 'test_paid'", order.id);
+        if (updated.changes !== 1) { db.exec('ROLLBACK'); return json(res, 409, { error: 'This order was already refunded.' }); }
+        run('INSERT INTO refunds (id, order_id, creator_id, amount_minor, state, reason, created_at, processed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', refund.id, refund.orderId, refund.creatorId, refund.amountMinor, refund.state, refund.reason, refund.createdAt, refund.createdAt);
+        audit(creator.id, 'refund.created', 'refund', refund.id, { orderId: order.id, amountMinor: refund.amountMinor, provider: 'local_test' });
+        db.exec('COMMIT');
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+      return json(res, 201, { refund });
+    }
+    if (order.provider !== 'razorpay' || order.state !== 'paid' || !order.provider_payment_id) return json(res, 409, { error: 'This order cannot be refunded.' });
+    if (!razorpay) return json(res, 503, { error: 'Razorpay is not configured for refunds.' });
+    let providerRefund;
+    try {
+      providerRefund = await razorpay.payments.refund(order.provider_payment_id, { amount: order.amount_minor, receipt: refund.id, notes: { local_order_id: order.id, reason: refund.reason || 'Creator initiated refund' } });
+    } catch (error) {
+      console.error('Razorpay refund creation failed:', error?.description || error?.message || error);
+      const status = Number(error?.statusCode) === 401 ? 401 : 500;
+      return json(res, status, { error: status === 401 ? 'Razorpay authentication failed. Check the server credentials.' : 'Could not create the refund. No refund was recorded; please try again.' });
+    }
+    if (!providerRefund?.id || providerRefund.payment_id !== order.provider_payment_id || providerRefund.amount !== order.amount_minor) return json(res, 502, { error: 'Razorpay returned an invalid refund response. Contact support before retrying.' });
+    refund.state = String(providerRefund.status || 'pending');
+    if (!['pending', 'processed', 'failed'].includes(refund.state)) return json(res, 502, { error: 'Razorpay returned an unsupported refund status. Contact support before retrying.' });
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      run('INSERT INTO refunds (id, order_id, creator_id, amount_minor, state, reason, provider_refund_id, provider_payment_id, created_at, processed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', refund.id, refund.orderId, refund.creatorId, refund.amountMinor, refund.state, refund.reason, providerRefund.id, order.provider_payment_id, refund.createdAt, refund.state === 'processed' ? refund.createdAt : null);
+      if (refund.state === 'processed') run("UPDATE orders SET state = 'refunded' WHERE id = ? AND state = 'paid'", order.id);
+      audit(creator.id, refund.state === 'processed' ? 'refund.processed' : 'refund.requested', 'refund', refund.id, { orderId: order.id, amountMinor: refund.amountMinor, provider: 'razorpay', providerRefundId: providerRefund.id });
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+    return json(res, 201, { refund, providerStatus: refund.state });
+  }
   if (req.method === 'PATCH' && url.pathname === '/api/creator/profile') { const creator = requireCreator(req, res); if (!creator) return; const { name, bio, socialLinks, supportEmail, deliveryTerms, theme } = await readJson(req); const nextName = String(name ?? creator.name).trim(); const nextBio = String(bio ?? '').trim(); const nextDeliveryTerms = String(deliveryTerms ?? (creator.delivery_terms || '')).trim(); const nextTheme = String(theme ?? (creator.theme || 'violet')); const nextSupportEmail = String(supportEmail ?? (creator.support_email || creator.email)).trim().toLowerCase(); const links = socialLinks && typeof socialLinks === 'object' && !Array.isArray(socialLinks) ? { instagram: String(socialLinks.instagram || '').trim(), newsletter: String(socialLinks.newsletter || '').trim(), linkedin: String(socialLinks.linkedin || '').trim() } : null; if (nextName.length < 2 || nextName.length > 80 || nextBio.length > 500 || nextDeliveryTerms.length > 500 || !validEmail(nextSupportEmail) || !validThemes.has(nextTheme)) return json(res, 400, { error: 'Use valid profile details and one of the available storefront themes.' }); if (!links || Object.values(links).some((link) => !validSocialUrl(link))) return json(res, 400, { error: 'Social links must be valid http or https URLs.' }); run('UPDATE creators SET name = ?, bio = ?, social_links = ?, support_email = ?, delivery_terms = ?, theme = ? WHERE id = ?', nextName, nextBio, JSON.stringify(links), nextSupportEmail, nextDeliveryTerms, nextTheme, creator.id); return json(res, 200, { creator: serializeCreator({ ...creator, name: nextName, bio: nextBio, social_links: JSON.stringify(links), support_email: nextSupportEmail, delivery_terms: nextDeliveryTerms, theme: nextTheme }) }); }
   if (req.method === 'GET' && url.pathname === '/api/coupons') { const creator = requireCreator(req, res); if (!creator) return; return json(res, 200, { coupons: all('SELECT * FROM coupons WHERE creator_id = ? ORDER BY created_at DESC', creator.id).map(serializeCoupon) }); }
   if (req.method === 'POST' && url.pathname === '/api/coupons') { const creator = requireCreator(req, res); if (!creator) return; const { code, percentOff } = await readJson(req); const normalizedCode = String(code || '').trim().toUpperCase(); if (!validCouponCode(normalizedCode) || !Number.isInteger(percentOff) || percentOff < 1 || percentOff > 100) return json(res, 400, { error: 'Use a 3–24 character coupon code and a discount from 1% to 100%.' }); if (first('SELECT id FROM coupons WHERE creator_id = ? AND code = ?', creator.id, normalizedCode)) return json(res, 409, { error: 'That coupon code already exists.' }); const coupon = { id: `coupon_${randomUUID().replaceAll('-', '').slice(0, 16)}`, creatorId: creator.id, code: normalizedCode, percentOff, active: 1, createdAt: now() }; run('INSERT INTO coupons (id, creator_id, code, percent_off, active, created_at) VALUES (?, ?, ?, ?, ?, ?)', coupon.id, coupon.creatorId, coupon.code, coupon.percentOff, coupon.active, coupon.createdAt); return json(res, 201, { coupon: serializeCoupon({ ...coupon, percent_off: coupon.percentOff }) }); }
@@ -282,13 +347,24 @@ async function handleApi(req, res, url) {
     const eventId = typeof req.headers['x-razorpay-event-id'] === 'string' ? req.headers['x-razorpay-event-id'] : createHash('sha256').update(body).digest('hex');
     try { run('INSERT INTO webhook_events (id, provider, provider_event_id, event_type, payload, status, received_at) VALUES (?, ?, ?, ?, ?, ?, ?)', `webhook_${randomUUID().replaceAll('-', '').slice(0, 16)}`, 'razorpay', eventId, eventType, body, 'received', now()); }
     catch (error) { if (error?.errcode === 2067 || /UNIQUE constraint failed/.test(String(error?.message))) return json(res, 200, { received: true, duplicate: true }); throw error; }
-    if (eventType !== 'payment.captured') { run('UPDATE webhook_events SET status = ?, processed_at = ? WHERE provider = ? AND provider_event_id = ?', 'ignored', now(), 'razorpay', eventId); return json(res, 202, { received: true, ignored: true }); }
-    const payment = event.payload?.payment?.entity;
-    const order = payment?.order_id ? first('SELECT * FROM orders WHERE provider = ? AND provider_order_id = ?', 'razorpay', payment.order_id) : null;
-    if (!order || !payment?.id || payment.amount !== order.amount_minor || payment.currency !== order.currency) { run('UPDATE webhook_events SET status = ?, processed_at = ? WHERE provider = ? AND provider_event_id = ?', 'ignored', now(), 'razorpay', eventId); return json(res, 202, { received: true, ignored: true }); }
-    const settlement = settleRazorpayPayment(order, payment.id, 'payment.captured_webhook');
-    run('UPDATE webhook_events SET status = ?, processed_at = ? WHERE provider = ? AND provider_event_id = ?', settlement.status === 200 ? 'processed' : 'failed', now(), 'razorpay', eventId);
-    return json(res, settlement.status === 200 ? 202 : settlement.status, { received: true, ...settlement.body });
+    if (eventType === 'payment.captured') {
+      const payment = event.payload?.payment?.entity;
+      const order = payment?.order_id ? first('SELECT * FROM orders WHERE provider = ? AND provider_order_id = ?', 'razorpay', payment.order_id) : null;
+      if (!order || !payment?.id || payment.amount !== order.amount_minor || payment.currency !== order.currency) { run('UPDATE webhook_events SET status = ?, processed_at = ? WHERE provider = ? AND provider_event_id = ?', 'ignored', now(), 'razorpay', eventId); return json(res, 202, { received: true, ignored: true }); }
+      const settlement = settleRazorpayPayment(order, payment.id, 'payment.captured_webhook');
+      run('UPDATE webhook_events SET status = ?, processed_at = ? WHERE provider = ? AND provider_event_id = ?', settlement.status === 200 ? 'processed' : 'failed', now(), 'razorpay', eventId);
+      return json(res, settlement.status === 200 ? 202 : settlement.status, { received: true, ...settlement.body });
+    }
+    if (['refund.created', 'refund.processed', 'refund.failed'].includes(eventType)) {
+      const providerRefund = event.payload?.refund?.entity;
+      const refund = providerRefund?.id ? first('SELECT * FROM refunds WHERE provider_refund_id = ?', providerRefund.id) : null;
+      if (!refund) { run('UPDATE webhook_events SET status = ?, processed_at = ? WHERE provider = ? AND provider_event_id = ?', 'ignored', now(), 'razorpay', eventId); return json(res, 202, { received: true, ignored: true }); }
+      const settlement = settleRazorpayRefund(refund, providerRefund, `webhook:${eventType}`);
+      run('UPDATE webhook_events SET status = ?, processed_at = ? WHERE provider = ? AND provider_event_id = ?', settlement.status === 200 ? 'processed' : 'failed', now(), 'razorpay', eventId);
+      return json(res, settlement.status === 200 ? 202 : settlement.status, { received: true, ...settlement.body });
+    }
+    run('UPDATE webhook_events SET status = ?, processed_at = ? WHERE provider = ? AND provider_event_id = ?', 'ignored', now(), 'razorpay', eventId);
+    return json(res, 202, { received: true, ignored: true });
   }
   return json(res, 404, { error: 'API route not found.' });
 }
